@@ -5,147 +5,70 @@
 //!
 //! # Memory Model
 //!
-//! The module uses static mutable buffers for result and error storage:
-//! - Result buffer: 1MB for storing successful evaluation results
-//! - Error buffer: 1MB for storing error messages
+//! The module uses a single static buffer for output storage (1MB).
+//! All responses are valid JSON - either the evaluation result or an error object.
 //!
 //! # Usage Pattern
 //!
 //! ```text
-//! 1. Allocate memory in WASM for logic JSON string
-//! 2. Write logic JSON to that memory
-//! 3. Allocate memory for data JSON string
-//! 4. Write data JSON to that memory
-//! 5. Call apply_json_logic(logic_ptr, logic_len, data_ptr, data_len)
-//! 6. If result >= 0: call get_result_ptr() and read result_len bytes
-//! 7. If result < 0: call get_error_ptr() and read abs(result) bytes
+//! 1. Write logic JSON string to WASM memory
+//! 2. Write data JSON string to WASM memory  
+//! 3. Call apply_json_logic(logic_ptr, logic_len, data_ptr, data_len)
+//! 4. The return value is a packed pointer: high 32 bits = pointer, low 32 bits = length
+//! 5. Read `length` bytes from `pointer`
+//! 6. Parse the JSON - it's either the result or {"error": "message"}
 //! ```
-//!
-//! # Testing Recommendations
-//!
-//! The following test cases should be covered:
-//! - Test with valid JSON logic and data
-//! - Test with invalid JSON in logic parameter
-//! - Test with invalid JSON in data parameter
-//! - Test with logic that causes evaluation errors
-//! - Test with very large results that might exceed buffer
-//! - Test with null/empty inputs
-//! - Test buffer clearing functionality
 
 use std::sync::Mutex;
 
-/// Buffer size: 1MB for both result and error buffers
+/// Buffer size: 1MB for output
 const BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Static buffer for storing successful results.
+/// Static buffer for storing output (results or errors).
 /// Protected by a Mutex for thread safety (even though WASM is typically single-threaded).
-static RESULT_BUFFER: Mutex<[u8; BUFFER_SIZE]> = Mutex::new([0u8; BUFFER_SIZE]);
-
-/// Static buffer for storing error messages.
-/// Protected by a Mutex for thread safety.
-static ERROR_BUFFER: Mutex<[u8; BUFFER_SIZE]> = Mutex::new([0u8; BUFFER_SIZE]);
+static OUTPUT_BUFFER: Mutex<[u8; BUFFER_SIZE]> = Mutex::new([0u8; BUFFER_SIZE]);
 
 /// Returns the maximum buffer size (1MB).
 ///
 /// This function can be used by callers to determine the maximum size
-/// of results or errors that can be returned.
+/// of output that can be returned.
 #[no_mangle]
 pub extern "C" fn get_buffer_size() -> i32 {
     BUFFER_SIZE as i32
 }
 
-/// Clears both result and error buffers (sets all bytes to 0).
+/// Writes output to the buffer and returns a packed pointer.
 ///
-/// This function should be called before making a new `apply_json_logic` call
-/// if you want to ensure clean buffers.
-#[no_mangle]
-pub extern "C" fn clear_buffers() {
-    // SAFETY: We acquire the mutex lock before modifying the buffer.
-    // The mutex ensures exclusive access to the buffer.
-    if let Ok(mut result) = RESULT_BUFFER.lock() {
-        result.fill(0);
-    }
-    if let Ok(mut error) = ERROR_BUFFER.lock() {
-        error.fill(0);
-    }
-}
+/// Returns a 64-bit value where:
+/// - High 32 bits: pointer to the output buffer (truncated to 32 bits for WASM32)
+/// - Low 32 bits: length of the output
+fn write_output(output: &str) -> i64 {
+    let bytes = output.as_bytes();
 
-/// Returns pointer to the result buffer.
-///
-/// After a successful call to `apply_json_logic` (return value >= 0),
-/// use this pointer to read the result. The number of bytes to read
-/// is the return value of `apply_json_logic`.
-#[no_mangle]
-pub extern "C" fn get_result_ptr() -> *const u8 {
-    // SAFETY: We return a pointer to the static buffer.
-    // The buffer has a fixed address and lifetime.
-    // The caller must ensure they don't read more bytes than returned by apply_json_logic.
-    match RESULT_BUFFER.lock() {
-        Ok(guard) => guard.as_ptr(),
-        Err(_) => std::ptr::null(),
-    }
-}
-
-/// Returns pointer to the error buffer.
-///
-/// After a failed call to `apply_json_logic` (return value < 0),
-/// use this pointer to read the error message. The number of bytes to read
-/// is the absolute value of the return value of `apply_json_logic`.
-#[no_mangle]
-pub extern "C" fn get_error_ptr() -> *const u8 {
-    // SAFETY: We return a pointer to the static buffer.
-    // The buffer has a fixed address and lifetime.
-    // The caller must ensure they don't read more bytes than abs(return value) of apply_json_logic.
-    match ERROR_BUFFER.lock() {
-        Ok(guard) => guard.as_ptr(),
-        Err(_) => std::ptr::null(),
-    }
-}
-
-/// Writes an error message to the error buffer.
-///
-/// Returns the negative length of the error message (for use as return value).
-fn write_error(message: &str) -> i32 {
-    let error_json = format!(r#"{{"error": "{}"}}"#, escape_json_string(message));
-    let bytes = error_json.as_bytes();
-
-    match ERROR_BUFFER.lock() {
-        Ok(mut error_buffer) => {
+    match OUTPUT_BUFFER.lock() {
+        Ok(mut buffer) => {
             let len = bytes.len().min(BUFFER_SIZE);
-            error_buffer[..len].copy_from_slice(&bytes[..len]);
-
-            // If the message was truncated, indicate that
-            if bytes.len() > BUFFER_SIZE {
-                // Negative length indicates error
-                -(BUFFER_SIZE as i32)
-            } else {
-                -(len as i32)
-            }
+            buffer[..len].copy_from_slice(&bytes[..len]);
+            
+            // Pack pointer and length into a single i64
+            // High 32 bits = pointer (as u32), Low 32 bits = length
+            // In WASM32, pointers are 32-bit, so this truncation is safe
+            let ptr = buffer.as_ptr() as usize as u32;
+            ((ptr as i64) << 32) | (len as i64)
         }
         Err(_) => {
-            // If we can't acquire the lock, return a minimal error
-            -1
+            // If we can't acquire the lock, return 0 (null pointer, zero length)
+            0
         }
     }
 }
 
-/// Writes a result to the result buffer.
+/// Writes an error as JSON to the output buffer.
 ///
-/// Returns the positive length of the result.
-fn write_result(result: &str) -> i32 {
-    let bytes = result.as_bytes();
-
-    match RESULT_BUFFER.lock() {
-        Ok(mut result_buffer) => {
-            let len = bytes.len().min(BUFFER_SIZE);
-            result_buffer[..len].copy_from_slice(&bytes[..len]);
-
-            // If the result was truncated, we still return the truncated length
-            // The caller should check against get_buffer_size() to detect truncation
-            len as i32
-        }
-        Err(_) => write_error("Failed to acquire result buffer lock"),
-    }
+/// Returns a packed pointer (same format as write_output).
+fn write_error(message: &str) -> i64 {
+    let error_json = format!(r#"{{"error":"{}"}}"#, escape_json_string(message));
+    write_output(&error_json)
 }
 
 /// Escapes special characters in a string for JSON.
@@ -169,9 +92,11 @@ fn escape_json_string(s: &str) -> String {
 
 /// Apply JSONLogic rules to data.
 ///
-/// Takes two JSON strings via pointer + length and returns:
-/// - Positive i32 for success: the length of the result stored in the result buffer
-/// - Negative i32 for error: the negative length of the error stored in the error buffer
+/// Takes two JSON strings via pointer + length and returns a packed pointer.
+/// The output is always valid JSON, stored in the output buffer.
+///
+/// On success, the output is the JSON result of the evaluation.
+/// On error, the output is a JSON object: `{"error": "error message"}`
 ///
 /// # Arguments
 ///
@@ -179,6 +104,18 @@ fn escape_json_string(s: &str) -> String {
 /// * `logic_len` - Length of the JSON logic string in bytes
 /// * `data_ptr` - Pointer to the JSON data string
 /// * `data_len` - Length of the JSON data string in bytes
+///
+/// # Returns
+///
+/// A packed 64-bit value where:
+/// - High 32 bits: pointer to the output buffer
+/// - Low 32 bits: length of the output in bytes
+///
+/// To unpack in the caller:
+/// ```text
+/// pointer = (result >> 32) & 0xFFFFFFFF
+/// length = result & 0xFFFFFFFF
+/// ```
 ///
 /// # Safety
 ///
@@ -193,21 +130,21 @@ pub extern "C" fn apply_json_logic(
     logic_len: i32,
     data_ptr: *const u8,
     data_len: i32,
-) -> i32 {
+) -> i64 {
     // Validate input pointers
     if logic_ptr.is_null() {
-        return write_error("Logic pointer is null");
+        return write_error("logic pointer is null");
     }
     if data_ptr.is_null() {
-        return write_error("Data pointer is null");
+        return write_error("data pointer is null");
     }
 
     // Validate lengths
     if logic_len < 0 {
-        return write_error("Logic length is negative");
+        return write_error("logic length is negative");
     }
     if data_len < 0 {
-        return write_error("Data length is negative");
+        return write_error("data length is negative");
     }
 
     // Convert pointers to slices
@@ -223,21 +160,21 @@ pub extern "C" fn apply_json_logic(
     // Convert slices to UTF-8 strings
     let logic_str = match std::str::from_utf8(logic_slice) {
         Ok(s) => s,
-        Err(e) => return write_error(&format!("Invalid UTF-8 in logic: {}", e)),
+        Err(e) => return write_error(&format!("invalid UTF-8 in logic: {}", e)),
     };
     let data_str = match std::str::from_utf8(data_slice) {
         Ok(s) => s,
-        Err(e) => return write_error(&format!("Invalid UTF-8 in data: {}", e)),
+        Err(e) => return write_error(&format!("invalid UTF-8 in data: {}", e)),
     };
 
     // Parse JSON strings
     let logic_value: serde_json::Value = match serde_json::from_str(logic_str) {
         Ok(v) => v,
-        Err(e) => return write_error(&format!("Failed to parse logic JSON: {}", e)),
+        Err(e) => return write_error(&format!("failed to parse logic JSON: {}", e)),
     };
     let data_value: serde_json::Value = match serde_json::from_str(data_str) {
         Ok(v) => v,
-        Err(e) => return write_error(&format!("Failed to parse data JSON: {}", e)),
+        Err(e) => return write_error(&format!("failed to parse data JSON: {}", e)),
     };
 
     // Apply JSONLogic
@@ -245,11 +182,11 @@ pub extern "C" fn apply_json_logic(
         Ok(result) => {
             // Serialize the result to JSON
             match serde_json::to_string(&result) {
-                Ok(json) => write_result(&json),
-                Err(e) => write_error(&format!("Failed to serialize result: {}", e)),
+                Ok(json) => write_output(&json),
+                Err(e) => write_error(&format!("failed to serialize result: {}", e)),
             }
         }
-        Err(e) => write_error(&format!("JSONLogic evaluation error: {}", e)),
+        Err(e) => write_error(&format!("evaluation error: {}", e)),
     }
 }
 
@@ -257,46 +194,24 @@ pub extern "C" fn apply_json_logic(
 mod tests {
     use super::*;
 
+    /// Helper to get the length from packed result
+    fn get_length(packed: i64) -> usize {
+        (packed & 0xFFFFFFFF) as usize
+    }
+
+    /// Helper to read output from the buffer using the packed result length
+    fn read_output(packed: i64) -> String {
+        let len = get_length(packed);
+        if len == 0 {
+            return String::new();
+        }
+        let buffer = OUTPUT_BUFFER.lock().unwrap();
+        std::str::from_utf8(&buffer[..len]).unwrap().to_string()
+    }
+
     #[test]
     fn test_get_buffer_size() {
         assert_eq!(get_buffer_size(), 1024 * 1024);
-    }
-
-    #[test]
-    fn test_clear_buffers() {
-        // Hold both locks for the entire test to prevent interference from parallel tests
-        let mut result_guard = RESULT_BUFFER.lock().unwrap();
-        let mut error_guard = ERROR_BUFFER.lock().unwrap();
-        
-        // Write something to buffers directly
-        result_guard[0] = b't';
-        result_guard[1] = b'e';
-        result_guard[2] = b's';
-        result_guard[3] = b't';
-        error_guard[0] = b'e';
-        error_guard[1] = b'r';
-        error_guard[2] = b'r';
-
-        // Clear buffers by filling with zeros
-        result_guard.fill(0);
-        error_guard.fill(0);
-
-        // Verify only the first few bytes we wrote are cleared
-        // (checking the entire 1MB buffer would be slow)
-        assert!(result_guard[0..10].iter().all(|&b| b == 0));
-        assert!(error_guard[0..10].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_get_result_ptr() {
-        let ptr = get_result_ptr();
-        assert!(!ptr.is_null());
-    }
-
-    #[test]
-    fn test_get_error_ptr() {
-        let ptr = get_error_ptr();
-        assert!(!ptr.is_null());
     }
 
     #[test]
@@ -311,12 +226,11 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result > 0);
+        let len = get_length(result);
+        assert!(len > 0);
 
-        // Read the result
-        let result_buffer = RESULT_BUFFER.lock().unwrap();
-        let result_str = std::str::from_utf8(&result_buffer[..result as usize]).unwrap();
-        assert_eq!(result_str, "true");
+        let output = read_output(result);
+        assert_eq!(output, "true");
     }
 
     #[test]
@@ -331,11 +245,8 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result > 0);
-
-        let result_buffer = RESULT_BUFFER.lock().unwrap();
-        let result_str = std::str::from_utf8(&result_buffer[..result as usize]).unwrap();
-        assert_eq!(result_str, r#""bar""#);
+        let output = read_output(result);
+        assert_eq!(output, r#""bar""#);
     }
 
     #[test]
@@ -350,13 +261,9 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result < 0);
-
-        // Read the error
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("error"));
-        assert!(error_str.contains("parse logic JSON"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
+        assert!(output.contains("parse logic JSON"));
     }
 
     #[test]
@@ -371,12 +278,9 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result < 0);
-
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("error"));
-        assert!(error_str.contains("parse data JSON"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
+        assert!(output.contains("parse data JSON"));
     }
 
     #[test]
@@ -390,11 +294,9 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result < 0);
-
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("Logic pointer is null"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
+        assert!(output.contains("logic pointer is null"));
     }
 
     #[test]
@@ -408,11 +310,9 @@ mod tests {
             0,
         );
 
-        assert!(result < 0);
-
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("Data pointer is null"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
+        assert!(output.contains("data pointer is null"));
     }
 
     #[test]
@@ -427,11 +327,9 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result < 0);
-
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("Logic length is negative"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
+        assert!(output.contains("logic length is negative"));
     }
 
     #[test]
@@ -447,11 +345,8 @@ mod tests {
             data.len() as i32,
         );
 
-        assert!(result < 0);
-
-        let error_buffer = ERROR_BUFFER.lock().unwrap();
-        let error_str = std::str::from_utf8(&error_buffer[..(-result) as usize]).unwrap();
-        assert!(error_str.contains("error"));
+        let output = read_output(result);
+        assert!(output.contains("error"));
     }
 
     #[test]
@@ -462,5 +357,25 @@ mod tests {
         assert_eq!(escape_json_string("hello\nworld"), "hello\\nworld");
         assert_eq!(escape_json_string("hello\rworld"), "hello\\rworld");
         assert_eq!(escape_json_string("hello\tworld"), "hello\\tworld");
+    }
+
+    #[test]
+    fn test_packed_pointer_format() {
+        let logic = r#"{"==": [1, 1]}"#;
+        let data = r#"{}"#;
+
+        let result = apply_json_logic(
+            logic.as_ptr(),
+            logic.len() as i32,
+            data.as_ptr(),
+            data.len() as i32,
+        );
+
+        // Verify the packed format
+        let ptr = ((result >> 32) & 0xFFFFFFFF) as u32;
+        let len = (result & 0xFFFFFFFF) as u32;
+        
+        assert!(ptr != 0, "Pointer should not be null");
+        assert_eq!(len, 4, "Length should be 4 for 'true'");
     }
 }

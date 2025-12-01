@@ -5,11 +5,13 @@ This document describes the C-style FFI (Foreign Function Interface) for the jso
 
 ## Overview
 
-The FFI interface replaces the previous `wasm-bindgen` based interface with a C-compatible interface that works with any WASM runtime. This enables cross-platform usage without JavaScript-specific bindings.
+The FFI interface provides a simple C-compatible interface that works with any WASM runtime. All outputs (including errors) are returned as valid JSON, making the API easy to use.
+
+The API uses a **packed pointer** approach: `apply_json_logic` returns a single 64-bit value containing both the output pointer and length, so you only need to call one function.
 
 ## Memory Model
 
-The module uses static mutable buffers for result and error storage:
+The module uses a single static buffer for output storage:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -17,15 +19,10 @@ The module uses static mutable buffers for result and error storage:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Result Buffer (1MB)                         │   │
-│  │  get_result_ptr() → returns pointer to this buffer       │   │
-│  │  Stores successful JSONLogic evaluation results          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              Error Buffer (1MB)                          │   │
-│  │  get_error_ptr() → returns pointer to this buffer        │   │
-│  │  Stores error messages as JSON: {"error": "message"}     │   │
+│  │              Output Buffer (1MB)                         │   │
+│  │  Stores all output as valid JSON:                        │   │
+│  │  - Results: the JSON evaluation result                   │   │
+│  │  - Errors: {"error": "message"}                          │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -42,7 +39,7 @@ The module uses static mutable buffers for result and error storage:
 ### `apply_json_logic`
 
 ```c
-int32_t apply_json_logic(
+int64_t apply_json_logic(
     const uint8_t* logic_ptr,
     int32_t logic_len,
     const uint8_t* data_ptr,
@@ -59,24 +56,18 @@ Apply JSONLogic rules to data.
 - `data_len`: Length of the JSON data string in bytes
 
 **Returns:**
-- Positive value: Success - the length of the result stored in the result buffer
-- Negative value: Error - the absolute value is the length of the error stored in the error buffer
+- A packed 64-bit value where:
+  - High 32 bits: pointer to the output buffer
+  - Low 32 bits: length of the output in bytes
+- The output is always valid JSON stored in the output buffer
+- On success: the JSON result of evaluation
+- On error: `{"error": "error message"}`
 
-### `get_result_ptr`
-
-```c
-const uint8_t* get_result_ptr();
+**Unpacking the result:**
 ```
-
-Returns a pointer to the result buffer. After a successful call to `apply_json_logic`, use this pointer to read the result.
-
-### `get_error_ptr`
-
-```c
-const uint8_t* get_error_ptr();
+pointer = (result >> 32) & 0xFFFFFFFF
+length = result & 0xFFFFFFFF
 ```
-
-Returns a pointer to the error buffer. After a failed call to `apply_json_logic`, use this pointer to read the error message.
 
 ### `get_buffer_size`
 
@@ -86,24 +77,15 @@ int32_t get_buffer_size();
 
 Returns the maximum buffer size (1MB = 1,048,576 bytes). Use this to detect if results might be truncated.
 
-### `clear_buffers`
-
-```c
-void clear_buffers();
-```
-
-Clears both result and error buffers (sets all bytes to 0). Call this before making a new `apply_json_logic` call if you want to ensure clean buffers.
-
 ## Usage Pattern
 
 ```text
-1. Allocate memory in WASM for logic JSON string
-2. Write logic JSON to that memory
-3. Allocate memory for data JSON string
-4. Write data JSON to that memory
-5. Call apply_json_logic(logic_ptr, logic_len, data_ptr, data_len)
-6. If result >= 0: call get_result_ptr() and read result_len bytes
-7. If result < 0: call get_error_ptr() and read abs(result) bytes
+1. Write logic JSON string to WASM memory
+2. Write data JSON string to WASM memory  
+3. Call apply_json_logic(logic_ptr, logic_len, data_ptr, data_len)
+4. Unpack the result: pointer = result >> 32, length = result & 0xFFFFFFFF
+5. Read `length` bytes from `pointer`
+6. Parse the JSON - it's either the result or {"error": "message"}
 ```
 
 ## Example Usage
@@ -128,23 +110,25 @@ async function applyJsonLogic(wasmInstance, logic, data) {
     new Uint8Array(memory.buffer, logicPtr).set(logicBytes);
     new Uint8Array(memory.buffer, dataPtr).set(dataBytes);
     
-    // Call the function
+    // Call the function - returns packed pointer
     const result = wasmInstance.exports.apply_json_logic(
         logicPtr, logicBytes.length,
         dataPtr, dataBytes.length
     );
     
-    if (result >= 0) {
-        // Success - read result
-        const resultPtr = wasmInstance.exports.get_result_ptr();
-        const resultBytes = new Uint8Array(memory.buffer, resultPtr, result);
-        return { success: true, data: decoder.decode(resultBytes) };
-    } else {
-        // Error - read error message
-        const errorPtr = wasmInstance.exports.get_error_ptr();
-        const errorBytes = new Uint8Array(memory.buffer, errorPtr, -result);
-        return { success: false, error: decoder.decode(errorBytes) };
+    // Unpack the result (64-bit BigInt in JS)
+    const ptr = Number(result >> 32n);
+    const len = Number(result & 0xFFFFFFFFn);
+    
+    // Read the output
+    const outputBytes = new Uint8Array(memory.buffer, ptr, len);
+    const output = JSON.parse(decoder.decode(outputBytes));
+    
+    // Check if it's an error
+    if (output.error) {
+        throw new Error(output.error);
     }
+    return output;
 }
 ```
 
@@ -164,17 +148,23 @@ public class JsonLogicRunner {
         int logicPtr = allocateAndWrite(logicBytes);
         int dataPtr = allocateAndWrite(dataBytes);
         
-        // Call the function
-        int result = instance.export("apply_json_logic")
+        // Call the function - returns packed pointer
+        long result = instance.export("apply_json_logic")
             .apply(logicPtr, logicBytes.length, dataPtr, dataBytes.length);
         
-        if (result >= 0) {
-            int resultPtr = instance.export("get_result_ptr").apply();
-            return readString(resultPtr, result);
-        } else {
-            int errorPtr = instance.export("get_error_ptr").apply();
-            throw new RuntimeException(readString(errorPtr, -result));
+        // Unpack the result
+        int ptr = (int)(result >> 32);
+        int len = (int)(result & 0xFFFFFFFF);
+        
+        // Read the output
+        String output = readString(ptr, len);
+        
+        // Parse and check for errors
+        JsonObject json = JsonParser.parseString(output).getAsJsonObject();
+        if (json.has("error")) {
+            throw new RuntimeException(json.get("error").getAsString());
         }
+        return output;
     }
 }
 ```
@@ -192,20 +182,28 @@ func applyJsonLogic(ctx context.Context, mod api.Module, logic, data string) (st
     logicPtr := allocateAndWrite(mod, logicBytes)
     dataPtr := allocateAndWrite(mod, dataBytes)
     
-    // Call the function
+    // Call the function - returns packed pointer
     results, _ := mod.ExportedFunction("apply_json_logic").Call(ctx,
         uint64(logicPtr), uint64(len(logicBytes)),
         uint64(dataPtr), uint64(len(dataBytes)),
     )
     
-    result := int32(results[0])
-    if result >= 0 {
-        resultPtr, _ := mod.ExportedFunction("get_result_ptr").Call(ctx)
-        return readString(mod, uint32(resultPtr[0]), uint32(result)), nil
-    } else {
-        errorPtr, _ := mod.ExportedFunction("get_error_ptr").Call(ctx)
-        return "", errors.New(readString(mod, uint32(errorPtr[0]), uint32(-result)))
+    result := results[0]
+    
+    // Unpack the result
+    ptr := uint32(result >> 32)
+    length := uint32(result & 0xFFFFFFFF)
+    
+    // Read the output
+    output := readString(mod, ptr, length)
+    
+    // Parse and check for errors
+    var parsed map[string]interface{}
+    json.Unmarshal([]byte(output), &parsed)
+    if errMsg, ok := parsed["error"].(string); ok {
+        return "", errors.New(errMsg)
     }
+    return output, nil
 }
 ```
 
@@ -227,22 +225,24 @@ public class JsonLogicRunner
         int logicPtr = AllocateAndWrite(logicBytes);
         int dataPtr = AllocateAndWrite(dataBytes);
         
-        // Call the function
-        var applyFn = _instance.GetFunction<int, int, int, int, int>("apply_json_logic");
-        int result = applyFn(logicPtr, logicBytes.Length, dataPtr, dataBytes.Length);
+        // Call the function - returns packed pointer
+        var applyFn = _instance.GetFunction<int, int, int, int, long>("apply_json_logic");
+        long result = applyFn(logicPtr, logicBytes.Length, dataPtr, dataBytes.Length);
         
-        if (result >= 0)
+        // Unpack the result
+        int ptr = (int)(result >> 32);
+        int len = (int)(result & 0xFFFFFFFF);
+        
+        // Read the output
+        string output = ReadString(ptr, len);
+        
+        // Parse and check for errors
+        var json = JsonSerializer.Deserialize<JsonElement>(output);
+        if (json.TryGetProperty("error", out var error))
         {
-            var getResultPtr = _instance.GetFunction<int>("get_result_ptr");
-            int resultPtr = getResultPtr();
-            return ReadString(resultPtr, result);
+            throw new Exception(error.GetString());
         }
-        else
-        {
-            var getErrorPtr = _instance.GetFunction<int>("get_error_ptr");
-            int errorPtr = getErrorPtr();
-            throw new Exception(ReadString(errorPtr, -result));
-        }
+        return output;
     }
 }
 ```
@@ -251,6 +251,7 @@ public class JsonLogicRunner
 
 ```python
 from wasmer import Store, Module, Instance
+import json
 
 def apply_json_logic(instance, logic: str, data: str) -> str:
     logic_bytes = logic.encode('utf-8')
@@ -260,18 +261,24 @@ def apply_json_logic(instance, logic: str, data: str) -> str:
     logic_ptr = allocate_and_write(instance, logic_bytes)
     data_ptr = allocate_and_write(instance, data_bytes)
     
-    # Call the function
+    # Call the function - returns packed pointer
     result = instance.exports.apply_json_logic(
         logic_ptr, len(logic_bytes),
         data_ptr, len(data_bytes)
     )
     
-    if result >= 0:
-        result_ptr = instance.exports.get_result_ptr()
-        return read_string(instance, result_ptr, result)
-    else:
-        error_ptr = instance.exports.get_error_ptr()
-        raise Exception(read_string(instance, error_ptr, -result))
+    # Unpack the result
+    ptr = (result >> 32) & 0xFFFFFFFF
+    length = result & 0xFFFFFFFF
+    
+    # Read the output
+    output = read_string(instance, ptr, length)
+    
+    # Parse and check for errors
+    parsed = json.loads(output)
+    if isinstance(parsed, dict) and 'error' in parsed:
+        raise Exception(parsed['error'])
+    return parsed
 ```
 
 ## Build Instructions
@@ -305,7 +312,7 @@ rustup target add wasm32-wasip1
 
 ## Error Handling
 
-All errors are returned as JSON strings in the format:
+All outputs are valid JSON. Errors are returned as JSON objects:
 
 ```json
 {"error": "error message here"}
@@ -314,35 +321,35 @@ All errors are returned as JSON strings in the format:
 ### Error Types
 
 1. **Input Validation Errors**
-   - `"Logic pointer is null"`
-   - `"Data pointer is null"`
-   - `"Logic length is negative"`
-   - `"Data length is negative"`
+   - `"logic pointer is null"`
+   - `"data pointer is null"`
+   - `"logic length is negative"`
+   - `"data length is negative"`
 
 2. **UTF-8 Errors**
-   - `"Invalid UTF-8 in logic: ..."`
-   - `"Invalid UTF-8 in data: ..."`
+   - `"invalid UTF-8 in logic: ..."`
+   - `"invalid UTF-8 in data: ..."`
 
 3. **JSON Parsing Errors**
-   - `"Failed to parse logic JSON: ..."`
-   - `"Failed to parse data JSON: ..."`
+   - `"failed to parse logic JSON: ..."`
+   - `"failed to parse data JSON: ..."`
 
 4. **JSONLogic Evaluation Errors**
-   - `"JSONLogic evaluation error: ..."`
+   - `"evaluation error: ..."`
 
 5. **Serialization Errors**
-   - `"Failed to serialize result: ..."`
+   - `"failed to serialize result: ..."`
 
 ## Buffer Size Limitations
 
-- Both result and error buffers are 1MB (1,048,576 bytes)
+- The output buffer is 1MB (1,048,576 bytes)
 - If a result exceeds the buffer size, it will be truncated
 - Use `get_buffer_size()` to check the maximum size
 - For very large results, consider splitting the operation or processing in chunks
 
 ## Thread Safety
 
-The implementation uses `std::sync::Mutex` for thread safety of the static buffers. While WASM is typically single-threaded, this ensures safe operation in all environments.
+The implementation uses `std::sync::Mutex` for thread safety of the static buffer. While WASM is typically single-threaded, this ensures safe operation in all environments.
 
 ## Migration from wasm-bindgen
 
@@ -356,7 +363,7 @@ await init();
 const result = apply(logic, data);
 ```
 
-**After (C FFI):**
+**After (C FFI with packed pointer):**
 ```javascript
 const wasmInstance = await WebAssembly.instantiate(wasmModule);
 const result = applyJsonLogic(wasmInstance, JSON.stringify(logic), JSON.stringify(data));
@@ -364,5 +371,6 @@ const result = applyJsonLogic(wasmInstance, JSON.stringify(logic), JSON.stringif
 
 The main differences:
 1. Input must be JSON strings (not JavaScript objects)
-2. Manual memory management required
-3. Works with any WASM runtime, not just JavaScript
+2. Single function call returns packed pointer with output location
+3. All outputs (including errors) are valid JSON
+4. Works with any WASM runtime, not just JavaScript
