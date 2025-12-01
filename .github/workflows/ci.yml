@@ -198,6 +198,35 @@ jobs:
           path: js/
           name: wasm-pkg
 
+      # Build C FFI WASM modules (for Java/Chicory, Go, .NET, Python)
+      - name: "Install WASM targets"
+        run: |
+          rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-wasip1
+
+      - name: "Build WASM (wasm32-unknown-unknown)"
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: "Build WASM (wasm32-wasip1)"
+        run: cargo build --target wasm32-wasip1 --release
+
+      - name: "Check WASM artifacts"
+        run: |
+          ls -la target/wasm32-unknown-unknown/release/*.wasm
+          ls -la target/wasm32-wasip1/release/*.wasm
+
+      - uses: actions/upload-artifact@v4
+        name: "Upload WASM (wasm32-unknown-unknown)"
+        with:
+          path: target/wasm32-unknown-unknown/release/jsonlogic_rs.wasm
+          name: wasm-unknown-unknown
+
+      - uses: actions/upload-artifact@v4
+        name: "Upload WASM (wasm32-wasip1)"
+        with:
+          path: target/wasm32-wasip1/release/jsonlogic_rs.wasm
+          name: wasm-wasip1
+
   build-wheels:
     name: >
       Build Wheel
