@@ -7,6 +7,12 @@ pub mod js_op;
 mod op;
 mod value;
 
+// FFI module provides C-style interface for WASM targets.
+// This replaces the previous wasm-bindgen based javascript_iface module
+// to enable use from multiple languages (Java/Chicory, JavaScript, Python, Go, .NET)
+// through a single WASM module with C FFI.
+pub mod ffi;
+
 use error::Error;
 use value::{Evaluated, Parsed};
 
@@ -17,44 +23,57 @@ trait Parser<'a>: Sized + Into<Value> {
     fn evaluate(&self, data: &'a Value) -> Result<Evaluated, Error>;
 }
 
-#[cfg(feature = "wasm")]
-pub mod javascript_iface {
-    use serde_json::Value;
-    use wasm_bindgen::prelude::*;
-
-    fn to_serde_value(js_value: JsValue) -> Result<Value, JsValue> {
-        // If we're passed a string, try to parse it as JSON. If we fail,
-        // we will just return a Value::String, since that's a valid thing
-        // to pass in to JSONLogic.
-        // js_value
-        if js_value.is_string() {
-            let js_string = js_value.as_string().expect(
-                "Could not convert value to string, even though it was checked to be a string."
-            );
-            serde_json::from_str(&js_string).or(Ok(Value::String(js_string)))
-        } else {
-            // If we're passed anything else, convert it directly to a serde Value.
-            js_value
-                .into_serde::<Value>()
-                .map_err(|err| format!("{}", err))
-                .map_err(JsValue::from)
-        }
-    }
-
-    #[wasm_bindgen]
-    pub fn apply(value: JsValue, data: JsValue) -> Result<JsValue, JsValue> {
-        let value_json = to_serde_value(value)?;
-        let data_json = to_serde_value(data)?;
-
-        let res = crate::apply(&value_json, &data_json)
-            .map_err(|err| format!("{}", err))
-            .map_err(JsValue::from)?;
-
-        JsValue::from_serde(&res)
-            .map_err(|err| format!("{}", err))
-            .map_err(JsValue::from)
-    }
-}
+// NOTE: The previous wasm-bindgen based interface has been replaced with a C FFI interface.
+// The new interface is in src/ffi/wasm.rs and provides:
+// - apply_json_logic(logic_ptr, logic_len, data_ptr, data_len) -> i32
+// - get_result_ptr() -> *const u8
+// - get_error_ptr() -> *const u8
+// - get_buffer_size() -> i32
+// - clear_buffers()
+//
+// This enables the WASM module to be used from multiple languages without
+// requiring JavaScript-specific bindings.
+//
+// The original wasm-bindgen interface is preserved below (commented out) for reference:
+//
+// #[cfg(feature = "wasm")]
+// pub mod javascript_iface {
+//     use serde_json::Value;
+//     use wasm_bindgen::prelude::*;
+//
+//     fn to_serde_value(js_value: JsValue) -> Result<Value, JsValue> {
+//         // If we're passed a string, try to parse it as JSON. If we fail,
+//         // we will just return a Value::String, since that's a valid thing
+//         // to pass in to JSONLogic.
+//         // js_value
+//         if js_value.is_string() {
+//             let js_string = js_value.as_string().expect(
+//                 "Could not convert value to string, even though it was checked to be a string."
+//             );
+//             serde_json::from_str(&js_string).or(Ok(Value::String(js_string)))
+//         } else {
+//             // If we're passed anything else, convert it directly to a serde Value.
+//             js_value
+//                 .into_serde::<Value>()
+//                 .map_err(|err| format!("{}", err))
+//                 .map_err(JsValue::from)
+//         }
+//     }
+//
+//     #[wasm_bindgen]
+//     pub fn apply(value: JsValue, data: JsValue) -> Result<JsValue, JsValue> {
+//         let value_json = to_serde_value(value)?;
+//         let data_json = to_serde_value(data)?;
+//
+//         let res = crate::apply(&value_json, &data_json)
+//             .map_err(|err| format!("{}", err))
+//             .map_err(JsValue::from)?;
+//
+//         JsValue::from_serde(&res)
+//             .map_err(|err| format!("{}", err))
+//             .map_err(JsValue::from)
+//     }
+// }
 
 #[cfg(feature = "python")]
 pub mod python_iface {
