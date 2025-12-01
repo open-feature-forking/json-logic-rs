@@ -13,33 +13,13 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     runs-on: "${{ matrix.os }}"
     steps:
-      # Check out the code
       - uses: "actions/checkout@v4"
-
-      # We need node for some integration tests
-      - uses: "actions/setup-node@v4"
-
-      # Install python
-      - name: "Set up python"
-        uses: "actions/setup-python@v5"
-        with:
-          python-version: "${{ matrix.python-version }}"
-
-      - name: "Get Python Path"
-        id: get-py-path
-        shell: bash
-        run: |
-          echo "path=$(which python)" >> $GITHUB_OUTPUT
 
       # Set the current month and year (used for cache key)
       - name: "Get Date"
         id: get-date
-        # Outputs e.g. "202007"
-        # tbh I have yet to find the docs where this output format is
-        # defined, but I copied this from the official cache action's README.
         run: |
           echo "date=$(/bin/date -u '+%Y%m')" >> $GITHUB_OUTPUT
         shell: bash
@@ -57,98 +37,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Use the OS, the python version, and the hashed cargo lockfile as the
-          # cache key. The Python version shouldn't be necessary, but I have
-          # seen some weird failures in Windows CI where it gets the built
-          # python targets confused. The Python version is included at the
-          # end so it can be partially matched by cache keys in contexts
-          # where we're not iterating over python envs.
-          key: ${{ runner.os }}-${{ contains(runner.os, 'windows') && 'test-' || '' }}cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.python-version }}
-
-      # Cache `cargo install` built binaries
-      - name: "Cache Built Binaries"
-        id: "cache-binaries"
-        uses: "actions/cache@v4"
-        with:
-          path: "~/.cargo/bin"
-          # In theory, this should rebuild binaries once a month
-          key: "${{ runner.os }}-cargo-binaries-${{steps.get-date.outputs.date}}"
-
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: "v0.12.1"
-
-      - name: "Run Tests"
-        if: "${{ !contains(runner.os, 'windows') }}"
-        shell: bash
-        run: "cargo test --all-features"
-
-      - name: "Run Tests (Windows)"
-        if: "${{ contains(runner.os, 'windows') }}"
-        shell: bash
-        # Python behaves weirdly with setup.py develop in Windows,
-        # when it comes to loading DLLs, so on that platform we build and
-        # install the wheel and run the tests with that.
-        # Running `cargo test --features=wasm` runs all the regular lib
-        # tests plus the WASM integration tests, while excluding the
-        # python integration tests
-        run: |
-          cargo test --features=wasm
-          make develop-py-wheel
-          ls dist/*.whl
-          pip install dist/*.whl
-          echo "Running Tests"
-          python tests/test_py.py
-        env:
-          WINDOWS: "${{ contains(runner.os, 'windows') }}"
-          PYTHON: ${{ steps.get-py-path.outputs.path }}
-
-  build:
-    name: "Build Libs, WASM, and Python sdist"
-    needs: "test"
-    runs-on: ubuntu-latest
-    steps:
-      # Check out the code
-      - uses: "actions/checkout@v4"
-
-      # Install python
-      - name: "Set up python"
-        uses: "actions/setup-python@v5"
-        with:
-          python-version: "3.12"
-
-      - name: "Get Python Path"
-        id: get-py-path
-        shell: bash
-        run: |
-          echo "path=$(which python)" >> $GITHUB_OUTPUT
-
-      # Set the current month and year (used for cache key)
-      - name: "Get Date"
-        id: get-date
-        # Outputs e.g. "202007"
-        # tbh I have yet to find the docs where this output format is
-        # defined, but I copied this from the official cache action's README.
-        run: |
-          echo "date=$(/bin/date -u '+%Y%m')" >> $GITHUB_OUTPUT
-        shell: bash
-
-      # Generate the lockfile
-      - name: "Generate Cargo Lockfile"
-        run: "cargo generate-lockfile"
-
-      # Cache build dependencies
-      - name: "Cache Build Fragments"
-        id: "cache-build-fragments"
-        uses: "actions/cache@v4"
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # This should partial match the caches generated for the tests,
-          # which include a python version at the end.
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       # Cache `cargo install` built binaries
@@ -157,16 +45,51 @@ jobs:
         uses: "actions/cache@v4"
         with:
           path: "~/.cargo/bin"
-          # In theory, this should rebuild binaries once a month
           key: "${{ runner.os }}-cargo-binaries-${{steps.get-date.outputs.date}}"
 
-      - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+      - name: "Run Tests"
+        shell: bash
+        run: "cargo test"
+
+  build:
+    name: "Build Libs and WASM"
+    needs: "test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: "actions/checkout@v4"
+
+      # Set the current month and year (used for cache key)
+      - name: "Get Date"
+        id: get-date
+        run: |
+          echo "date=$(/bin/date -u '+%Y%m')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # Generate the lockfile
+      - name: "Generate Cargo Lockfile"
+        run: "cargo generate-lockfile"
+
+      # Cache build dependencies
+      - name: "Cache Build Fragments"
+        id: "cache-build-fragments"
+        uses: "actions/cache@v4"
         with:
-          version: "v0.12.1"
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Cache `cargo install` built binaries
+      - name: "Cache Built Binaries"
+        id: "cache-binaries"
+        uses: "actions/cache@v4"
+        with:
+          path: "~/.cargo/bin"
+          key: "${{ runner.os }}-cargo-binaries-${{steps.get-date.outputs.date}}"
 
       - name: "Build Rust/C Libraries"
-        run: "make build"
+        run: cargo build --release
 
       - name: "Check Rust target content"
         run: ls target/release
@@ -176,27 +99,6 @@ jobs:
         with:
           path: target/release/libjsonlogic_rs.*
           name: libs
-
-      - name: "Build Python Source Dist"
-        run: "make build-py-sdist"
-        env:
-          WINDOWS: "${{ contains(runner.os, 'windows') }}"
-          PYTHON: ${{ steps.get-py-path.outputs.path }}
-
-      - uses: actions/upload-artifact@v4
-        name: "Upload Python sdist"
-        with:
-          path: dist/*.tar.gz
-          name: py-sdist
-
-      - name: "Build WASM Node Package"
-        run: "make build-wasm"
-
-      - uses: actions/upload-artifact@v4
-        name: "Upload node package"
-        with:
-          path: js/
-          name: wasm-pkg
 
       # Build C FFI WASM modules (for Java/Chicory, Go, .NET, Python)
       - name: "Install WASM targets"
@@ -227,74 +129,13 @@ jobs:
           path: target/wasm32-wasip1/release/jsonlogic_rs.wasm
           name: wasm-wasip1
 
-  build-wheels:
-    name: >
-      Build Wheel
-      (${{ matrix.platform.os }}, ${{ matrix.platform.name }}, ${{ matrix.py }})
-    #    needs: test
-    runs-on: ${{ matrix.platform.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - { os: ubuntu-latest, name: manylinux }
-          - { os: ubuntu-latest, name: musllinux }
-          - { os: macos-latest, name: macosx }
-        py:
-          - cp39
-          - cp310
-          - cp311
-          - cp312
-          - cp313
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: all
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
-        env:
-          # configure cibuildwheel to build native archs ('auto'), and some
-          # emulated ones
-          CIBW_ARCHS_LINUX: x86_64 aarch64
-          # cross-compiling wheels for discrete architectures not working OOTB
-          # see: https://github.com/PyO3/setuptools-rust/issues/206
-          CIBW_ARCHS_MACOS: x86_64 universal2 arm64
-          CIBW_ARCHS_WINDOWS: AMD64
-          CIBW_BEFORE_ALL_LINUX: >
-            curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain stable -y
-          CIBW_BEFORE_ALL_MACOS: |
-            rustup target add aarch64-apple-darwin
-            rustup target add x86_64-apple-darwin
-          CIBW_ENVIRONMENT_LINUX: PATH=/root/.cargo/bin:$PATH
-          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=10.12
-          CIBW_BUILD: ${{ matrix.py }}-${{ matrix.platform.name }}_*
-          CIBW_TEST_COMMAND: python {project}/tests/test_py.py
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: py-wheels-${{ matrix.platform.name }}-${{ matrix.py }}
-          path: ./wheelhouse/*.whl
-
   distribute:
-    name: "Distribute Cargo, WASM, and Python Sdist Packages"
-    needs: ["build", "build-wheels"]
+    name: "Distribute Cargo Package"
+    needs: ["build"]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      # Check out the code
       - uses: "actions/checkout@v4"
-
-      # Install python
-      - name: "Set up python"
-        uses: "actions/setup-python@v5"
-        with:
-          python-version: "3.12"
 
       # Generate the lockfile
       - name: "Generate Cargo Lockfile"
@@ -317,32 +158,10 @@ jobs:
         run: |
           echo "new=$(./scripts/newCargoVersion.sh)" >> $GITHUB_OUTPUT
 
-      - name: "Check if new NPM version"
-        id: npm-version
-        shell: bash
-        run: |
-          echo "new=$(./scripts/newNpmVersion.sh)" >> $GITHUB_OUTPUT
-
-      # Note we don't check for a new python version b/c there are so
-      # many python artifacts that it is impractical. Instead we just
-      # upload with a `--skip-existing` flag, so if it's already there
-      # it wont' be an error.
-
       - name: "(DEBUG) new versions"
         shell: bash
         run: |
           echo "Cargo: ${{ steps.cargo-version.outputs.new }}"
-          echo "NPM: ${{ steps.npm-version.outputs.new }}"
-
-      - name: "Persist new cargo state for subsequent jobs"
-        shell: bash
-        run: |
-          echo "${{ steps.cargo-version.outputs.new }}" > tmp-new-cargo-ver
-
-      - uses: actions/upload-artifact@v4
-        with:
-          path: "tmp-new-cargo-ver"
-          name: "new-cargo"
 
       - name: "Cargo Publish"
         if: "${{ steps.cargo-version.outputs.new == 'true' }}"
@@ -350,58 +169,3 @@ jobs:
           cargo publish --token "$CARGO_TOKEN"
         env:
           CARGO_TOKEN: "${{ secrets.CARGO_TOKEN }}"
-
-      - name: "Pull WASM Artifact"
-        uses: actions/download-artifact@v4
-        if: "${{ steps.npm-version.outputs.new == 'true' }}"
-        with:
-          name: wasm-pkg
-          path: dist-wasm
-
-      - name: "Publish NPM Package"
-        shell: bash
-        if: "${{ steps.npm-version.outputs.new == 'true' }}"
-        run: |
-          echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > ~/.npmrc
-          npm publish dist-wasm/ --access public
-        env:
-          NPM_TOKEN: "${{ secrets.NPM_TOKEN }}"
-
-      - name: "Pull Python Sdist Artifact"
-        if: "${{ steps.cargo-version.outputs.new == 'true' }}"
-        uses: actions/download-artifact@v4
-        with:
-          name: py-sdist
-          path: dist-py
-
-      - name: "Publish Python Sdist"
-        if: "${{ steps.cargo-version.outputs.new == 'true' }}"
-        shell: bash
-        run: |
-          pip install twine
-          twine upload --skip-existing dist-py/*
-        env:
-          TWINE_USERNAME: "__token__"
-          TWINE_PASSWORD: "${{ secrets.PYPI_TOKEN }}"
-
-  distribute-py-wheels:
-    name: "Distribute Python Wheels"
-    needs: ["distribute"]
-    runs-on: ubuntu-latest
-    # upload to PyPI on every tag starting with 'v'
-    #    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v')
-    # alternatively, to publish when a GitHub Release is created, use the following rule:
-    if: github.event_name == 'release' && github.event.action == 'published'
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: py-wheels-*
-          merge-multiple: true
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_TOKEN }}
-          skip_existing: true
-          # To test: repository_url: https://test.pypi.org/legacy/
