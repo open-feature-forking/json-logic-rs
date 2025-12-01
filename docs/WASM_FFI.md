@@ -2,6 +2,7 @@
 
 This document describes the C-style FFI (Foreign Function Interface) for the json-logic-rs WASM module. This interface allows the JsonLogic library to be used from multiple languages (Java/Chicory, JavaScript, Python, Go, .NET) through a single WASM module.
 
+
 ## Overview
 
 The FFI interface replaces the previous `wasm-bindgen` based interface with a C-compatible interface that works with any WASM runtime. This enables cross-platform usage without JavaScript-specific bindings.
